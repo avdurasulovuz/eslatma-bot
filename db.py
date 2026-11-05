@@ -1,6 +1,6 @@
 import atexit
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import psycopg
@@ -109,6 +109,21 @@ def init_db():
             role TEXT DEFAULT 'helper',
             added_by BIGINT,
             added_at TIMESTAMP DEFAULT now()
+        )""",
+        """CREATE TABLE IF NOT EXISTS inbox (
+            id BIGSERIAL PRIMARY KEY,
+            user_id BIGINT,
+            kind TEXT,
+            text TEXT,
+            created_at TEXT,
+            status TEXT DEFAULT 'new',
+            result TEXT
+        )""",
+        """CREATE TABLE IF NOT EXISTS reactions (
+            day INTEGER,
+            user_id BIGINT,
+            value TEXT,
+            PRIMARY KEY (day, user_id)
         )""",
     ]
     with _get_pool().connection() as c:
@@ -253,6 +268,10 @@ def delete_daily_message(day):
         # Postgres'da PRIMARY KEY har qator bo'yicha tekshiriladi, shuning uchun ikki bosqichda suriladi
         c.execute("UPDATE daily_messages SET day = -(day-1) WHERE day>%s", (day,))
         c.execute("UPDATE daily_messages SET day = -day WHERE day<0")
+        # shu kunga bosilgan reaksiyalar o'chadi, keyingi kunlarniki ham birga suriladi
+        c.execute("DELETE FROM reactions WHERE day=%s", (day,))
+        c.execute("UPDATE reactions SET day = -(day-1) WHERE day>%s", (day,))
+        c.execute("UPDATE reactions SET day = -day WHERE day<0")
 
 
 def mark_sent(user_id, day, today_str):
@@ -306,3 +325,88 @@ def add_helper_admin(user_id, added_by=None, role="helper"):
 
 def remove_helper_admin(user_id):
     return _exec("DELETE FROM helper_admins WHERE user_id=%s", (user_id,)) > 0
+
+
+# ---------- Murojaatlar va takliflar (inbox) ----------
+def add_inbox(user_id, kind, text):
+    """kind: 'msg' (adminga yozilgan xabar) yoki 'suggest' (kunlik xabar taklifi)."""
+    row = _one(
+        "INSERT INTO inbox (user_id, kind, text, created_at) VALUES (%s,%s,%s,%s) RETURNING id",
+        (user_id, kind, text, now().strftime("%Y-%m-%d %H:%M")))
+    return row["id"]
+
+
+def count_inbox(kind=None, status="new"):
+    if kind:
+        return _scalar("SELECT COUNT(*) FROM inbox WHERE kind=%s AND status=%s", (kind, status))
+    return _scalar("SELECT COUNT(*) FROM inbox WHERE status=%s", (status,))
+
+
+def list_inbox(kind, status, limit, offset):
+    where, params = "i.status=%s", [status]
+    if kind:
+        where += " AND i.kind=%s"
+        params.append(kind)
+    return _all(
+        "SELECT i.*, u.full_name, u.username FROM inbox i "
+        "LEFT JOIN users u ON u.user_id=i.user_id "
+        f"WHERE {where} ORDER BY i.id DESC LIMIT %s OFFSET %s",
+        (*params, limit, offset))
+
+
+def get_inbox(item_id):
+    return _one(
+        "SELECT i.*, u.full_name, u.username FROM inbox i "
+        "LEFT JOIN users u ON u.user_id=i.user_id WHERE i.id=%s", (item_id,))
+
+
+def set_inbox_done(item_id, result):
+    _exec("UPDATE inbox SET status='done', result=%s WHERE id=%s", (result, item_id))
+
+
+def delete_inbox(item_id):
+    _exec("DELETE FROM inbox WHERE id=%s", (item_id,))
+
+
+def count_inbox_today(user_id, kind):
+    return _scalar("SELECT COUNT(*) FROM inbox WHERE user_id=%s AND kind=%s AND created_at LIKE %s",
+                   (user_id, kind, today() + "%"))
+
+
+# ---------- Reaksiyalar ----------
+def toggle_reaction(day, user_id, value):
+    """Reaksiyani qo'yadi. Xuddi shu reaksiya qayta bosilsa, olib tashlaydi (None qaytaradi)."""
+    row = _one("SELECT value FROM reactions WHERE day=%s AND user_id=%s", (day, user_id))
+    if row and row["value"] == value:
+        _exec("DELETE FROM reactions WHERE day=%s AND user_id=%s", (day, user_id))
+        return None
+    _exec("INSERT INTO reactions (day, user_id, value) VALUES (%s,%s,%s) "
+          "ON CONFLICT (day, user_id) DO UPDATE SET value=EXCLUDED.value", (day, user_id, value))
+    return value
+
+
+def reaction_stats(limit=3):
+    return _all(
+        "SELECT day, COUNT(*) FILTER (WHERE value='l') AS likes, "
+        "COUNT(*) FILTER (WHERE value='h') AS loves "
+        "FROM reactions GROUP BY day ORDER BY COUNT(*) DESC, day LIMIT %s", (limit,))
+
+
+# ---------- Statistika ----------
+def growth(days=7):
+    """Oxirgi `days` kun uchun har kuni nechta yangi foydalanuvchi qo'shilgani."""
+    first = now().date() - timedelta(days=days - 1)
+    rows = _all("SELECT start_date, COUNT(*) AS n FROM users WHERE start_date>=%s GROUP BY start_date",
+                (first.isoformat(),))
+    counts = {r["start_date"]: r["n"] for r in rows}
+    out = []
+    for i in range(days):
+        d = (first + timedelta(days=i)).isoformat()
+        out.append((d, counts.get(d, 0)))
+    return out
+
+
+def top_streaks(limit=5):
+    return _all(
+        "SELECT full_name, username, last_sent_day FROM users "
+        "WHERE active=1 AND last_sent_day>0 ORDER BY last_sent_day DESC, user_id LIMIT %s", (limit,))
