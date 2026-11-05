@@ -1,10 +1,16 @@
+import atexit
 import os
-import sqlite3
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-DB_PATH = os.getenv("DB_PATH", "bot.db")
+import psycopg
+from psycopg.rows import dict_row, tuple_row
+from psycopg_pool import ConnectionPool
+
+DATABASE_URL = (os.getenv("DATABASE_URL") or "").strip()
 TIMEZONE = os.getenv("TIMEZONE", "Asia/Tashkent")
+
+_pool = None
 
 
 def now():
@@ -16,118 +22,144 @@ def today():
     return now().date().isoformat()
 
 
-def conn():
-    c = sqlite3.connect(DB_PATH)
-    c.row_factory = sqlite3.Row
-    return c
+# ---------- Ulanish ----------
+def _get_pool() -> ConnectionPool:
+    global _pool
+    if _pool is None:
+        if not DATABASE_URL:
+            raise SystemExit(
+                "DATABASE_URL topilmadi. Railway'da botingiz xizmatiga Postgres'ning DATABASE_URL "
+                "o'zgaruvchisini qo'shing."
+            )
+        _pool = ConnectionPool(
+            DATABASE_URL,
+            min_size=1,
+            max_size=5,
+            kwargs={"row_factory": dict_row},
+            check=ConnectionPool.check_connection,  # uzilgan ulanishlarni avtomatik yangilaydi
+            open=True,
+        )
+        _pool.wait(timeout=30)
+        atexit.register(_pool.close)  # dastur tugaganda ulanishlar tartib bilan yopiladi
+    return _pool
 
 
-def _add_column(c, table, column, ddl):
-    cols = [r["name"] for r in c.execute(f"PRAGMA table_info({table})")]
-    if column not in cols:
-        c.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
+def _exec(sql, params=()):
+    """So'rovni bajaradi (yozish). O'zgargan qatorlar sonini qaytaradi."""
+    with _get_pool().connection() as c:
+        return c.execute(sql, params).rowcount
+
+
+def _all(sql, params=()):
+    with _get_pool().connection() as c:
+        return c.execute(sql, params).fetchall()
+
+
+def _one(sql, params=()):
+    with _get_pool().connection() as c:
+        return c.execute(sql, params).fetchone()
+
+
+def _scalar(sql, params=()):
+    with _get_pool().connection() as c:
+        cur = c.cursor(row_factory=tuple_row)
+        cur.execute(sql, params)
+        return cur.fetchone()[0]
 
 
 def init_db():
-    with conn() as c:
-        c.executescript("""
-        CREATE TABLE IF NOT EXISTS users (
-            user_id INTEGER PRIMARY KEY,
+    statements = [
+        """CREATE TABLE IF NOT EXISTS users (
+            user_id BIGINT PRIMARY KEY,
             full_name TEXT,
             username TEXT,
             start_date TEXT,
             active INTEGER DEFAULT 1,
             last_sent_day INTEGER DEFAULT 0,
             last_sent_date TEXT
-        );
-        CREATE TABLE IF NOT EXISTS daily_messages (
+        )""",
+        """CREATE TABLE IF NOT EXISTS daily_messages (
             day INTEGER PRIMARY KEY,
-            text TEXT NOT NULL DEFAULT ''
-        );
-        CREATE TABLE IF NOT EXISTS sent_log (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
+            text TEXT NOT NULL DEFAULT '',
+            voice_id TEXT,
+            btn_text TEXT,
+            btn_url TEXT
+        )""",
+        """CREATE TABLE IF NOT EXISTS sent_log (
+            id BIGSERIAL PRIMARY KEY,
+            user_id BIGINT,
             day INTEGER,
-            sent_at TEXT DEFAULT CURRENT_TIMESTAMP
-        );
-        CREATE TABLE IF NOT EXISTS settings (
+            sent_at TIMESTAMP DEFAULT now()
+        )""",
+        """CREATE TABLE IF NOT EXISTS settings (
             key TEXT PRIMARY KEY,
             value TEXT
-        );
-        CREATE TABLE IF NOT EXISTS scheduled (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+        )""",
+        """CREATE TABLE IF NOT EXISTS scheduled (
+            id BIGSERIAL PRIMARY KEY,
             run_at TEXT NOT NULL,
             text TEXT,
             voice_id TEXT,
             btn_text TEXT,
             btn_url TEXT,
             done INTEGER DEFAULT 0
-        );
-        CREATE TABLE IF NOT EXISTS helper_admins (
-            user_id INTEGER PRIMARY KEY,
+        )""",
+        """CREATE TABLE IF NOT EXISTS helper_admins (
+            user_id BIGINT PRIMARY KEY,
             role TEXT DEFAULT 'helper',
-            added_by INTEGER,
-            added_at TEXT DEFAULT CURRENT_TIMESTAMP
-        );
-        """)
-        # Eski bazalar uchun yangi ustunlar
-        _add_column(c, "daily_messages", "voice_id", "TEXT")
-        _add_column(c, "daily_messages", "btn_text", "TEXT")
-        _add_column(c, "daily_messages", "btn_url", "TEXT")
+            added_by BIGINT,
+            added_at TIMESTAMP DEFAULT now()
+        )""",
+    ]
+    with _get_pool().connection() as c:
+        for s in statements:
+            c.execute(s)
 
 
 # ---------- Sozlamalar ----------
 def get_setting(key, default=None):
-    with conn() as c:
-        row = c.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
-        return row["value"] if row else default
+    row = _one("SELECT value FROM settings WHERE key=%s", (key,))
+    return row["value"] if row else default
 
 
 def set_setting(key, value):
-    with conn() as c:
-        if value is None:
-            c.execute("DELETE FROM settings WHERE key=?", (key,))
-        else:
-            c.execute("INSERT INTO settings (key, value) VALUES (?,?) "
-                      "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, value))
+    if value is None:
+        _exec("DELETE FROM settings WHERE key=%s", (key,))
+    else:
+        _exec("INSERT INTO settings (key, value) VALUES (%s,%s) "
+              "ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value", (key, value))
 
 
 # ---------- Foydalanuvchilar ----------
 def add_user(user_id, full_name, username):
     """Yangi foydalanuvchini saqlaydi. Yangi bo'lsa True qaytaradi."""
-    with conn() as c:
-        row = c.execute("SELECT 1 FROM users WHERE user_id=?", (user_id,)).fetchone()
-        if row:
-            c.execute("UPDATE users SET active=1, full_name=?, username=? WHERE user_id=?",
-                      (full_name, username, user_id))
-            return False
-        c.execute(
-            "INSERT INTO users (user_id, full_name, username, start_date) VALUES (?,?,?,?)",
-            (user_id, full_name, username, today()),
-        )
-        return True
+    updated = _exec("UPDATE users SET active=1, full_name=%s, username=%s WHERE user_id=%s",
+                    (full_name, username, user_id))
+    if updated:
+        return False
+    inserted = _exec(
+        "INSERT INTO users (user_id, full_name, username, start_date) VALUES (%s,%s,%s,%s) "
+        "ON CONFLICT (user_id) DO NOTHING",
+        (user_id, full_name, username, today()))
+    return inserted > 0
 
 
 def active_users():
-    with conn() as c:
-        return c.execute("SELECT * FROM users WHERE active=1").fetchall()
+    return _all("SELECT * FROM users WHERE active=1")
 
 
 def all_users():
-    with conn() as c:
-        return c.execute("SELECT * FROM users ORDER BY start_date, user_id").fetchall()
+    return _all("SELECT * FROM users ORDER BY start_date, user_id")
 
 
 def count_users():
-    with conn() as c:
-        return c.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+    return _scalar("SELECT COUNT(*) FROM users")
 
 
 def list_users(limit, offset):
-    with conn() as c:
-        return c.execute(
-            "SELECT * FROM users ORDER BY start_date DESC, user_id DESC LIMIT ? OFFSET ?",
-            (limit, offset)).fetchall()
+    return _all(
+        "SELECT * FROM users ORDER BY start_date DESC, user_id DESC LIMIT %s OFFSET %s",
+        (limit, offset))
 
 
 def search_users(q, limit=15):
@@ -135,164 +167,142 @@ def search_users(q, limit=15):
     if not q:
         return []
     like = f"%{q}%"
-    with conn() as c:
-        if q.isdigit():
-            return c.execute(
-                "SELECT * FROM users WHERE user_id=? OR username LIKE ? OR full_name LIKE ? LIMIT ?",
-                (int(q), like, like, limit)).fetchall()
-        return c.execute(
-            "SELECT * FROM users WHERE username LIKE ? OR full_name LIKE ? LIMIT ?",
-            (like, like, limit)).fetchall()
+    if q.isdigit() and len(q) <= 18:
+        return _all(
+            "SELECT * FROM users WHERE user_id=%s OR username ILIKE %s OR full_name ILIKE %s LIMIT %s",
+            (int(q), like, like, limit))
+    return _all(
+        "SELECT * FROM users WHERE username ILIKE %s OR full_name ILIKE %s LIMIT %s",
+        (like, like, limit))
 
 
 def find_user(q):
     """ID yoki @username bo'yicha bitta foydalanuvchini topadi."""
     q = q.strip()
-    with conn() as c:
-        if q.lstrip("-").isdigit():
-            return c.execute("SELECT * FROM users WHERE user_id=?", (int(q),)).fetchone()
-        return c.execute("SELECT * FROM users WHERE LOWER(username)=LOWER(?)",
-                         (q.lstrip("@"),)).fetchone()
+    if q.lstrip("-").isdigit() and len(q) <= 19:
+        return _one("SELECT * FROM users WHERE user_id=%s", (int(q),))
+    return _one("SELECT * FROM users WHERE LOWER(username)=LOWER(%s)", (q.lstrip("@"),))
 
 
 def get_user(user_id):
-    with conn() as c:
-        return c.execute("SELECT * FROM users WHERE user_id=?", (user_id,)).fetchone()
+    return _one("SELECT * FROM users WHERE user_id=%s", (user_id,))
 
 
 def reset_user_progress(user_id):
     """Foydalanuvchi kunlarini 1-kundan qayta boshlaydi."""
-    with conn() as c:
-        c.execute("UPDATE users SET last_sent_day=0, last_sent_date=NULL WHERE user_id=?", (user_id,))
+    _exec("UPDATE users SET last_sent_day=0, last_sent_date=NULL WHERE user_id=%s", (user_id,))
 
 
 def set_active(user_id, active):
-    with conn() as c:
-        c.execute("UPDATE users SET active=? WHERE user_id=?", (int(bool(active)), user_id))
+    _exec("UPDATE users SET active=%s WHERE user_id=%s", (int(bool(active)), user_id))
 
 
 def set_inactive(user_id):
-    with conn() as c:
-        c.execute("UPDATE users SET active=0 WHERE user_id=?", (user_id,))
+    _exec("UPDATE users SET active=0 WHERE user_id=%s", (user_id,))
 
 
 def stats():
     t = today()
-    with conn() as c:
-        total = c.execute("SELECT COUNT(*) FROM users").fetchone()[0]
-        active = c.execute("SELECT COUNT(*) FROM users WHERE active=1").fetchone()[0]
-        new_today = c.execute("SELECT COUNT(*) FROM users WHERE start_date=?", (t,)).fetchone()[0]
-        sent_today = c.execute("SELECT COUNT(*) FROM users WHERE last_sent_date=?", (t,)).fetchone()[0]
-        msgs = c.execute("SELECT COUNT(*) FROM daily_messages").fetchone()[0]
-        sched = c.execute("SELECT COUNT(*) FROM scheduled WHERE done=0").fetchone()[0]
-        return {
-            "total": total,
-            "active": active,
-            "blocked": total - active,
-            "new_today": new_today,
-            "sent_today": sent_today,
-            "messages": msgs,
-            "scheduled": sched,
-        }
+    total = _scalar("SELECT COUNT(*) FROM users")
+    active = _scalar("SELECT COUNT(*) FROM users WHERE active=1")
+    return {
+        "total": total,
+        "active": active,
+        "blocked": total - active,
+        "new_today": _scalar("SELECT COUNT(*) FROM users WHERE start_date=%s", (t,)),
+        "sent_today": _scalar("SELECT COUNT(*) FROM users WHERE last_sent_date=%s", (t,)),
+        "messages": _scalar("SELECT COUNT(*) FROM daily_messages"),
+        "scheduled": _scalar("SELECT COUNT(*) FROM scheduled WHERE done=0"),
+    }
 
 
 # ---------- Kunlik xabarlar ----------
 def add_daily_message(text, voice_id=None, btn_text=None, btn_url=None):
-    with conn() as c:
-        n = c.execute("SELECT COALESCE(MAX(day),0) FROM daily_messages").fetchone()[0] + 1
+    with _get_pool().connection() as c:
+        c.execute("LOCK TABLE daily_messages IN EXCLUSIVE MODE")  # ikkita admin bir vaqtda qo'shsa ham raqam takrorlanmaydi
+        n = c.cursor(row_factory=tuple_row).execute(
+            "SELECT COALESCE(MAX(day),0) FROM daily_messages").fetchone()[0] + 1
         c.execute(
-            "INSERT INTO daily_messages (day, text, voice_id, btn_text, btn_url) VALUES (?,?,?,?,?)",
+            "INSERT INTO daily_messages (day, text, voice_id, btn_text, btn_url) VALUES (%s,%s,%s,%s,%s)",
             (n, text or "", voice_id, btn_text, btn_url))
         return n
 
 
 def total_daily_messages():
-    with conn() as c:
-        return c.execute("SELECT COUNT(*) FROM daily_messages").fetchone()[0]
+    return _scalar("SELECT COUNT(*) FROM daily_messages")
 
 
 def get_daily_message(day):
-    with conn() as c:
-        row = c.execute("SELECT * FROM daily_messages WHERE day=?", (day,)).fetchone()
-        return dict(row) if row else None
+    row = _one("SELECT * FROM daily_messages WHERE day=%s", (day,))
+    return dict(row) if row else None
 
 
 def list_daily_messages():
-    with conn() as c:
-        return [dict(r) for r in c.execute("SELECT * FROM daily_messages ORDER BY day")]
+    return [dict(r) for r in _all("SELECT * FROM daily_messages ORDER BY day")]
 
 
 def update_daily_message(day, text, voice_id=None, btn_text=None, btn_url=None):
-    with conn() as c:
-        c.execute(
-            "UPDATE daily_messages SET text=?, voice_id=?, btn_text=?, btn_url=? WHERE day=?",
-            (text or "", voice_id, btn_text, btn_url, day))
+    _exec("UPDATE daily_messages SET text=%s, voice_id=%s, btn_text=%s, btn_url=%s WHERE day=%s",
+          (text or "", voice_id, btn_text, btn_url, day))
 
 
 def delete_daily_message(day):
     """Xabarni o'chiradi va keyingi kunlar raqamini bittaga kamaytiradi."""
-    with conn() as c:
-        c.execute("DELETE FROM daily_messages WHERE day=?", (day,))
-        c.execute("UPDATE daily_messages SET day=day-1 WHERE day>?", (day,))
+    with _get_pool().connection() as c:
+        c.execute("DELETE FROM daily_messages WHERE day=%s", (day,))
+        # Postgres'da PRIMARY KEY har qator bo'yicha tekshiriladi, shuning uchun ikki bosqichda suriladi
+        c.execute("UPDATE daily_messages SET day = -(day-1) WHERE day>%s", (day,))
+        c.execute("UPDATE daily_messages SET day = -day WHERE day<0")
 
 
 def mark_sent(user_id, day, today_str):
-    with conn() as c:
-        c.execute("UPDATE users SET last_sent_day=?, last_sent_date=? WHERE user_id=?",
+    with _get_pool().connection() as c:
+        c.execute("UPDATE users SET last_sent_day=%s, last_sent_date=%s WHERE user_id=%s",
                   (day, today_str, user_id))
-        c.execute("INSERT INTO sent_log (user_id, day) VALUES (?,?)", (user_id, day))
+        c.execute("INSERT INTO sent_log (user_id, day) VALUES (%s,%s)", (user_id, day))
 
 
 # ---------- Rejalashtirilgan xabarlar ----------
 def add_scheduled(run_at, text, voice_id=None, btn_text=None, btn_url=None):
-    with conn() as c:
-        cur = c.execute(
-            "INSERT INTO scheduled (run_at, text, voice_id, btn_text, btn_url) VALUES (?,?,?,?,?)",
-            (run_at, text or "", voice_id, btn_text, btn_url))
-        return cur.lastrowid
+    row = _one(
+        "INSERT INTO scheduled (run_at, text, voice_id, btn_text, btn_url) "
+        "VALUES (%s,%s,%s,%s,%s) RETURNING id",
+        (run_at, text or "", voice_id, btn_text, btn_url))
+    return row["id"]
 
 
 def list_scheduled():
-    with conn() as c:
-        return [dict(r) for r in c.execute(
-            "SELECT * FROM scheduled WHERE done=0 ORDER BY run_at")]
+    return [dict(r) for r in _all("SELECT * FROM scheduled WHERE done=0 ORDER BY run_at")]
 
 
 def due_scheduled(now_str):
-    with conn() as c:
-        return [dict(r) for r in c.execute(
-            "SELECT * FROM scheduled WHERE done=0 AND run_at<=? ORDER BY run_at", (now_str,))]
+    return [dict(r) for r in _all(
+        "SELECT * FROM scheduled WHERE done=0 AND run_at<=%s ORDER BY run_at", (now_str,))]
 
 
 def mark_scheduled_done(sid):
-    with conn() as c:
-        c.execute("UPDATE scheduled SET done=1 WHERE id=?", (sid,))
+    _exec("UPDATE scheduled SET done=1 WHERE id=%s", (sid,))
 
 
 def delete_scheduled(sid):
-    with conn() as c:
-        c.execute("DELETE FROM scheduled WHERE id=?", (sid,))
+    _exec("DELETE FROM scheduled WHERE id=%s", (sid,))
 
 
 # ---------- Yordamchi adminlar ----------
 def is_helper_admin(user_id):
-    with conn() as c:
-        return c.execute("SELECT 1 FROM helper_admins WHERE user_id=?", (user_id,)).fetchone() is not None
+    return _one("SELECT 1 AS ok FROM helper_admins WHERE user_id=%s", (user_id,)) is not None
 
 
 def list_helper_admins():
-    with conn() as c:
-        return [dict(r) for r in c.execute("SELECT * FROM helper_admins ORDER BY added_at, user_id")]
+    return [dict(r) for r in _all("SELECT * FROM helper_admins ORDER BY added_at, user_id")]
 
 
 def add_helper_admin(user_id, added_by=None, role="helper"):
-    with conn() as c:
-        c.execute(
-            "INSERT INTO helper_admins (user_id, role, added_by) VALUES (?,?,?) "
-            "ON CONFLICT(user_id) DO UPDATE SET role=excluded.role",
-            (user_id, role, added_by))
+    _exec(
+        "INSERT INTO helper_admins (user_id, role, added_by) VALUES (%s,%s,%s) "
+        "ON CONFLICT (user_id) DO UPDATE SET role=EXCLUDED.role",
+        (user_id, role, added_by))
 
 
 def remove_helper_admin(user_id):
-    with conn() as c:
-        return c.execute("DELETE FROM helper_admins WHERE user_id=?", (user_id,)).rowcount > 0
+    return _exec("DELETE FROM helper_admins WHERE user_id=%s", (user_id,)) > 0

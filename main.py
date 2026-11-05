@@ -12,7 +12,7 @@ from aiogram.filters import Command, CommandStart, BaseFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (BufferedInputFile, CallbackQuery, InlineKeyboardButton,
-                           KeyboardButton, Message, ReplyKeyboardMarkup)
+                           KeyboardButton, Message, ReplyKeyboardMarkup, ReplyKeyboardRemove)
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from dotenv import load_dotenv
@@ -56,7 +56,8 @@ PAGE = 10
 BTN_PANEL = "🛠 Admin panel"
 BTN_LAST = "📖 Oxirgi xabarim"
 # Eski versiyadagi tugmalar (ular hali ba'zi chatlarda turgan bo'lishi mumkin)
-LEGACY_BUTTONS = {"📊 Statistika", "📢 Hammaga xabar", "👥 Foydalanuvchilar", "⏳ Mening hisoblagichlarim"}
+LEGACY_BUTTONS = {"📊 Statistika", "📢 Hammaga xabar", "👥 Foydalanuvchilar", "⏳ Mening hisoblagichlarim",
+                  BTN_LAST}  # "Oxirgi xabarim" tugmasi olib tashlangan; eski klaviaturani tozalaydi
 
 DEFAULT_WELCOME = (
     "Assalomu alaykum, {name}! Kundalik eslatmalar botiga xush kelibsiz!\n\n"
@@ -246,10 +247,12 @@ class HelperFlow(StatesGroup):
 
 # =============== Klaviaturalar ===============
 def reply_kb(is_admin: bool = False):
-    """Pastdagi doimiy tugmalar: faqat bittadan-ikkitasi, ustma-ust to'planib ketmaydi."""
-    row = [KeyboardButton(text=BTN_PANEL)] if is_admin else []
-    row.append(KeyboardButton(text=BTN_LAST))
-    return ReplyKeyboardMarkup(keyboard=[row], resize_keyboard=True, is_persistent=True)
+    """Pastdagi doimiy tugma: faqat adminda '🛠 Admin panel'. Oddiy foydalanuvchida tugma yo'q
+    (ReplyKeyboardRemove eski tugmalarni ham o'chirib yuboradi)."""
+    if not is_admin:
+        return ReplyKeyboardRemove()
+    return ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text=BTN_PANEL)]],
+                               resize_keyboard=True, is_persistent=True)
 
 
 def is_paused() -> bool:
@@ -1091,19 +1094,6 @@ async def check_subscription(call: CallbackQuery):
         return
     await call.answer("Rahmat!")
     await welcome(call.message, call.from_user)
-
-
-@user_router.message(F.text == BTN_LAST)
-async def last_message(message: Message):
-    """Foydalanuvchiga oxirgi olgan kunlik xabarini qayta ko'rsatadi."""
-    u = db.get_user(message.from_user.id)
-    total = db.total_daily_messages()
-    if not u or not u["last_sent_day"] or not total:
-        await message.answer("Sizga hali kunlik xabar yuborilmagan. Xabar belgilangan vaqtda keladi.")
-        return
-    row = db.get_daily_message((u["last_sent_day"] - 1) % total + 1)
-    if row:
-        await send_content(message.chat.id, row_to_content(row), DAILY_PREFIX)
 
 
 @user_router.message(F.text.in_(LEGACY_BUTTONS))
