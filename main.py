@@ -1,8 +1,12 @@
 import asyncio
+import html
 import io
+import json
 import logging
 import os
 import re
+import sqlite3
+import tempfile
 from datetime import datetime
 from pathlib import Path
 
@@ -50,6 +54,20 @@ admin.message.filter(AdminAccessFilter())
 admin.callback_query.filter(AdminAccessFilter())
 
 
+async def autodel_admin_msgs(handler, event: Message, data):
+    """Admin yozgan hamma narsa (buyruq, ID, matn, javob) handler ishlagandan keyin o'chadi."""
+    try:
+        return await handler(event, data)
+    finally:
+        try:
+            await event.delete()
+        except Exception:
+            pass  # 48 soatdan eski yoki allaqachon o'chgan
+
+
+admin.message.middleware(autodel_admin_msgs)
+
+
 def is_admin_id(user_id: int) -> bool:
     return user_id == ADMIN_ID or db.is_helper_admin(user_id)
 
@@ -58,12 +76,18 @@ DEFAULT_TITLE = "Kun eslatmasi"
 PAGE = 10
 INBOX_PAGE = 8
 MSG_LIMIT_PER_DAY = 10
+DELETE_WINDOW_HOURS = 48
 
+BTN_SEND = "📢 Xabar yuborish"
 BTN_PANEL = "🛠 Admin panel"
+BTN_CLEAN = "🧹 Tozalash"
 BTN_LAST = "📖 Oxirgi xabarim"
 # Eski versiyadagi tugmalar (ular hali ba'zi chatlarda turgan bo'lishi mumkin)
-LEGACY_BUTTONS = {"📊 Statistika", "📢 Hammaga xabar", "👥 Foydalanuvchilar", "⏳ Mening hisoblagichlarim",
-                  BTN_LAST}
+LEGACY_BUTTONS = {"📊 Statistika", "📢 Hammaga xabar", "👥 Foydalanuvchilar", "⏳ Mening hisoblagichlarim"}
+# Oddiy foydalanuvchi bularni bossa, xabar sifatida adminga ketmasin
+USER_STALE_BUTTONS = LEGACY_BUTTONS | {BTN_SEND, BTN_PANEL, BTN_CLEAN, BTN_LAST}
+
+WEEKDAYS = ["Dushanba", "Seshanba", "Chorshanba", "Payshanba", "Juma", "Shanba", "Yakshanba"]
 
 DEFAULT_WELCOME = (
     "👋 Assalomu alaykum, {name}!\n\n"
@@ -76,6 +100,67 @@ CHANNEL_KEYS = {
     "required_channel": "📣 Majburiy obuna",
     "copy_channel": "📢 Kanalga nusxa",
 }
+
+
+# =============== Rangli tugmalar (Telegram Bot API: style) ===============
+STYLE_INLINE = "style" in InlineKeyboardButton.model_fields
+STYLE_REPLY = "style" in KeyboardButton.model_fields
+
+
+def pick_style(text: str):
+    """Tugma matniga qarab rang: primary=ko'k, success=yashil, danger=qizil."""
+    t = text.strip()
+    if t in ("◀️", "▶️ ", "❌ Yopish") or t.startswith("⬅️") or t in ("◀️", "▶️"):
+        return None  # navigatsiya tugmalari oddiy qoladi
+    if "o'chirish" in t.lower() or t.startswith(("❌", "🗑", "🚫", "⏸")):
+        return "danger"
+    if t.startswith(("✅", "▶️", "➕")):
+        return "success"
+    return "primary"
+
+
+def paint(kb):
+    """Klaviaturadagi tugmalarni bo'yaydi (havolali tugmalarga tegmaydi). Eski aiogramda ranglarsiz ishlaydi."""
+    if not kb or not STYLE_INLINE:
+        return kb
+    rows = []
+    for row in kb.inline_keyboard:
+        new = []
+        for b in row:
+            if b.url or getattr(b, "style", None):
+                new.append(b)
+                continue
+            s = pick_style(b.text)
+            new.append(b.model_copy(update={"style": s}) if s else b)
+        rows.append(new)
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def kbtn(text: str, style: str = None):
+    if style and STYLE_REPLY:
+        return KeyboardButton(text=text, style=style)
+    return KeyboardButton(text=text)
+
+
+# =============== Baza bilan xavfsiz ishlash ===============
+def dbcall(name: str, *args, default=None, **kw):
+    """db.py da funksiya bo'lmasa yoki xato bersa, bot yiqilmaydi (default qaytadi)."""
+    fn = getattr(db, name, None)
+    if fn is None:
+        logging.warning("db.%s topilmadi (db.py hali yangilanmagan)", name)
+        return default
+    try:
+        return fn(*args, **kw)
+    except Exception:
+        logging.exception("db.%s xatosi", name)
+        return default
+
+
+def log_action(user, action: str, details: str = ""):
+    """Admin harakatlari jurnali: kim, qachon, nima qilgan."""
+    uid = user.id if user else 0
+    name = (user.full_name if user else "—") or "—"
+    dbcall("log_action", uid, name, action, details)
 
 
 # =============== Yordamchilar ===============
@@ -107,6 +192,10 @@ def row_to_content(r: dict) -> dict:
 
 def data_to_content(data: dict) -> dict:
     return row_to_content(data)
+
+
+def preview_of(c: dict) -> str:
+    return short(c.get("text") or "", 40) or "🎤 Ovozli xabar"
 
 
 def rx_row(day: int, mine=None):
@@ -142,21 +231,26 @@ def daily_prefix(day: int) -> str:
 
 
 async def send_content(chat_id, c: dict, prefix: str = "", rx_day=None):
+    """Kunlik xabar (rx_day bor) matni spoiler bo'ladi: xira ko'rinadi, bosilsa ochiladi."""
     kb = content_kb(c, rx_day)
-    text = c.get("text") or ""
+    text = html.escape(c.get("text") or "", quote=False)
+    if rx_day and text:
+        text = f"<tg-spoiler>{text}</tg-spoiler>"
+    head = html.escape(prefix, quote=False)
     if c.get("voice_id"):
-        caption = (prefix + text) if (prefix and text) else (text or prefix.strip() or None)
-        return await bot.send_voice(chat_id, c["voice_id"], caption=caption, reply_markup=kb)
-    return await bot.send_message(chat_id, prefix + text, reply_markup=kb)
+        caption = (head + text) if (head and text) else (text or head.strip() or None)
+        return await bot.send_voice(chat_id, c["voice_id"], caption=caption,
+                                    parse_mode="HTML", reply_markup=kb)
+    return await bot.send_message(chat_id, head + text, parse_mode="HTML", reply_markup=kb)
 
 
 GONE_MARKERS = ("chat not found", "deactivated", "user not found", "bot was blocked")
 
 
-async def safe_send(user_id: int, c: dict, prefix: str = "", rx_day=None) -> bool:
+async def safe_send(user_id: int, c: dict, prefix: str = "", rx_day=None):
+    """Yuborilgan Message ni qaytaradi, yuborilmasa None."""
     try:
-        await send_content(user_id, c, prefix, rx_day)
-        return True
+        return await send_content(user_id, c, prefix, rx_day)
     except TelegramRetryAfter as e:
         await asyncio.sleep(e.retry_after)
         return await safe_send(user_id, c, prefix, rx_day)
@@ -166,32 +260,47 @@ async def safe_send(user_id: int, c: dict, prefix: str = "", rx_day=None) -> boo
         if any(m in str(e).lower() for m in GONE_MARKERS):
             db.set_inactive(user_id)  # chat yo'q yoki akkaunt o'chirilgan
         else:
-            logging.warning("Yuborib bo'lmadi %s: %s", user_id, e)  # masalan, noto'g'ri file_id: foydalanuvchi aybsiz
+            logging.warning("Yuborib bo'lmadi %s: %s", user_id, e)
     except Exception as e:
         logging.warning("Xatolik %s: %s", user_id, e)
-    return False
+    return None
 
 
 async def send_to_all(c: dict, prefix: str = ""):
+    """(yetdi, yetmadi, [(chat_id, message_id), ...]) qaytaradi."""
     sent = failed = 0
+    items = []
     for user in db.active_users():
-        if await safe_send(user["user_id"], c, prefix):
+        m = await safe_send(user["user_id"], c, prefix)
+        if m:
             sent += 1
+            items.append((m.chat.id, m.message_id))
         else:
             failed += 1
         await asyncio.sleep(0.05)  # Telegram limiti: ~30 xabar/soniya
-    return sent, failed
+    return sent, failed, items
 
 
 async def copy_to_channel(c: dict):
-    """Ommaviy xabarning nusxasini sozlangan kanalga yuboradi (kunlik xabarlar kanalga ketmaydi)."""
+    """Ommaviy xabarning nusxasini sozlangan kanalga yuboradi. Yuborilgan xabarni qaytaradi."""
     channel = db.get_setting("copy_channel")
     if not channel:
-        return
+        return None
     try:
-        await send_content(channel, c)
+        return await send_content(channel, c)
     except Exception as e:
         logging.warning("Kanalga nusxa yuborib bo'lmadi: %s", e)
+        return None
+
+
+async def broadcast(c: dict, kind: str, admin_id: int = 0):
+    """Hammaga yuboradi, kanalga nusxa qo'yadi va 'Yuborilganlar' uchun hamma xabar ID larini saqlaydi."""
+    sent, failed, items = await send_to_all(c)
+    ch = await copy_to_channel(c)
+    if ch:
+        items.append((ch.chat.id, ch.message_id))
+    batch_id = dbcall("save_batch", kind, preview_of(c), admin_id, sent, failed, items)
+    return sent, failed, batch_id
 
 
 async def tell(user_id: int, text: str) -> bool:
@@ -203,9 +312,19 @@ async def tell(user_id: int, text: str) -> bool:
         return False
 
 
-# ---------- Avto-tozalash ----------
+async def notify_admin(text: str):
+    if not ADMIN_ID:
+        return
+    try:
+        await bot.send_message(ADMIN_ID, text)
+    except Exception:
+        pass
+
+
+# ---------- Avto-tozalash va 🧹 Tozalash ----------
 _timers: dict[tuple[int, int], asyncio.Task] = {}  # (chat_id, message_id) -> Task
 _panels: dict[int, int] = {}  # chat_id -> ochiq panel message_id
+_service: dict[int, set] = {}  # chat_id -> xizmat xabarlari (🧹 Tozalash faqat shularni o'chiradi)
 
 
 def autoclose_minutes() -> int:
@@ -222,10 +341,13 @@ def _cancel(key):
 
 
 def schedule_delete(msg, seconds: int):
-    """Xabarni `seconds` soniyadan keyin o'chiradi (qayta chaqirilsa, taymer yangilanadi)."""
-    if not msg or seconds <= 0:
+    """Xizmat xabarini ro'yxatga oladi va `seconds` soniyadan keyin o'chiradi (qayta chaqirilsa, taymer yangilanadi)."""
+    if not msg:
         return
     key = (msg.chat.id, msg.message_id)
+    _service.setdefault(key[0], set()).add(key[1])
+    if seconds <= 0:
+        return
     _cancel(key)
 
     async def job():
@@ -240,6 +362,7 @@ def schedule_delete(msg, seconds: int):
         finally:
             if _timers.get(key) is me:
                 _timers.pop(key, None)
+            _service.get(key[0], set()).discard(key[1])
             if _panels.get(key[0]) == key[1]:
                 _panels.pop(key[0], None)
 
@@ -250,6 +373,17 @@ def schedule_autoclose(msg):
     schedule_delete(msg, autoclose_minutes() * 60)
 
 
+async def clean_service(chat_id: int):
+    """Xizmat xabarlarini o'chiradi. Hammaga yuborilganlar ro'yxatda yo'q, shuning uchun qoladi."""
+    for mid in list(_service.pop(chat_id, set())):
+        _cancel((chat_id, mid))
+        try:
+            await bot.delete_message(chat_id, mid)
+        except TelegramBadRequest:
+            pass
+    _panels.pop(chat_id, None)
+
+
 async def note(msg, text: str, seconds: int = 20, **kw):
     """Qisqa xizmat xabari: bir necha soniyadan keyin o'zi o'chadi."""
     m = await msg.answer(text, **kw)
@@ -257,9 +391,17 @@ async def note(msg, text: str, seconds: int = 20, **kw):
     return m
 
 
+async def ask(msg, text: str, kb=None):
+    """Savol/izoh xabari: avto-yopish vaqtidan keyin o'zi o'chadi."""
+    m = await msg.answer(text, reply_markup=paint(kb) if kb else None)
+    schedule_autoclose(m)
+    return m
+
+
 async def show(target, text, kb=None):
     """Tugma bosilsa xabarni tahrirlaydi, oddiy xabar bo'lsa yangi xabar yuboradi.
     Admin xabarlari harakatsiz qolsa, avto-yopish vaqtidan keyin o'chadi."""
+    kb = paint(kb)
     if isinstance(target, CallbackQuery):
         msg = target.message
         try:
@@ -283,6 +425,7 @@ class Compose(StatesGroup):
     button = State()
     when = State()
     target = State()
+    rtime = State()
 
 
 class EditSearch(StatesGroup):
@@ -325,12 +468,16 @@ class Suggest(StatesGroup):
 
 # =============== Klaviaturalar ===============
 def reply_kb(is_admin: bool = False):
-    """Pastdagi doimiy tugma: faqat adminda '🛠 Admin panel'. Oddiy foydalanuvchida tugma yo'q
+    """Pastdagi doimiy tugmalar: faqat adminda. Oddiy foydalanuvchida tugma yo'q
     (ReplyKeyboardRemove eski tugmalarni ham o'chirib yuboradi)."""
     if not is_admin:
         return ReplyKeyboardRemove()
-    return ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text=BTN_PANEL)]],
-                               resize_keyboard=True, is_persistent=True)
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [kbtn(BTN_SEND, "primary"), kbtn(BTN_PANEL, "primary")],
+            [kbtn(BTN_CLEAN, "danger"), kbtn(BTN_LAST, "primary")],
+        ],
+        resize_keyboard=True, is_persistent=True)
 
 
 def is_paused() -> bool:
@@ -355,7 +502,7 @@ def build_kb(rows, back=None):
         nav.append(InlineKeyboardButton(text="⬅️ Orqaga", callback_data=back))
     nav.append(InlineKeyboardButton(text="❌ Yopish", callback_data="close"))
     kb.row(*nav)
-    return kb.as_markup()
+    return paint(kb.as_markup())
 
 
 def back_kb(target="panel", text="⬅️ Orqaga"):
@@ -363,99 +510,52 @@ def back_kb(target="panel", text="⬅️ Orqaga"):
     kb.button(text=text, callback_data=target)
     kb.button(text="❌ Yopish", callback_data="close")
     kb.adjust(2)
-    return kb.as_markup()
+    return paint(kb.as_markup())
 
 
 def cancel_kb():
     kb = InlineKeyboardBuilder()
     kb.button(text="❌ Bekor qilish", callback_data="panel")
-    return kb.as_markup()
+    return paint(kb.as_markup())
 
 
 def onoff(flag: bool) -> str:
     return "✅ yoqiq" if flag else "🚫 o‘chiq"
 
 
-def screen(name: str, uid: int = 0):
-    """Admin panelning ekranlari: (matn, klaviatura). Panel 2 darajali: bosh menyu → bo'lim."""
+def screen(name: str = "panel", uid: int = 0):
+    """Tekis admin panel: hamma tugma bitta ekranda, ichma-ich bo'limlarsiz."""
     s = db.stats()
     new_inb = db.count_inbox(None, "new")
-    if name == "msg":
-        text = "📨 Xabarlar\n\nFoydalanuvchilarga yuboriladigan xabarlar."
-        rows = [
-            [(f"📋 Kunlik xabarlar ({s['messages']})", "list")],
-            [("📢 Hammaga xabar", "bc"), ("✉️ Alohida xabar", "single")],
-            [(f"📅 Rejalashtirilgan ({s['scheduled']})", "sched")],
-        ]
-        return text, build_kb(rows, "panel")
-    if name == "inb":
-        n_msg, n_sug = db.count_inbox("msg", "new"), db.count_inbox("suggest", "new")
-        text = ("💬 Murojaatlar\n\nFoydalanuvchilarning sizga yozgan xabarlari va "
-                "kunlik xabar sifatida yuborgan takliflari.")
-        rows = [
-            [(f"💬 Xabarlar ({n_msg})", "inbox:msg:0")],
-            [(f"💡 Takliflar ({n_sug})", "inbox:sug:0")],
-            [(f"🗂 Arxiv ({db.count_inbox(None, 'done')})", "inbox:arch:0")],
-        ]
-        return text, build_kb(rows, "panel")
-    if name == "usr":
-        text = f"👥 Foydalanuvchilar\n\nFaol: {s['active']} · jami: {s['total']}"
-        rows = [[("👥 Ro'yxat / qidirish", "users:0")], [("📥 Excel yuklab olish", "export")]]
-        return text, build_kb(rows, "panel")
-    if name == "set":
-        text = "⚙️ Sozlamalar"
-        rows = [
-            [("⏰ Yuborish", "menu:send"), ("📝 Matnlar", "menu:text")],
-            [("📣 Kanal", "menu:chan"), ("👁 Ko'rinish", "menu:look")],
-        ]
-        if uid == ADMIN_ID:
-            rows.append([("🧑‍💼 Adminlar", "helpers")])
-        return text, build_kb(rows, "panel")
-    if name == "send":
-        text = (f"⏰ Yuborish\n\nVaqt: {send_time()} ({TIMEZONE})\n"
-                f"Kunlik yuborish: {'⏸ to‘xtatilgan' if is_paused() else '✅ faol'}")
-        rows = [
-            [("⏰ Vaqtni o'zgartirish", "time")],
-            [("▶️ Yuborishni yoqish" if is_paused() else "⏸ Yuborishni to'xtatish", "pause")],
-        ]
-        return text, build_kb(rows, "menu:set")
-    if name == "text":
-        title = db.get_setting("daily_title") or DEFAULT_TITLE
-        text = f"📝 Matnlar\n\nKunlik xabar sarlavhasi: {title}\nSalomlashuv: {short(welcome_text(), 60)}"
-        rows = [[("👋 Salomlashuv matni", "welcome")], [("🏷 Kun sarlavhasi", "dtitle")]]
-        return text, build_kb(rows, "menu:set")
-    if name == "chan":
-        text = ("📣 Kanal\n\n"
-                f"Majburiy obuna: {db.get_setting('required_channel') or 'o‘chiq'}\n"
-                f"Kanalga nusxa: {db.get_setting('copy_channel') or 'o‘chiq'}")
-        rows = [[("📣 Majburiy obuna", "ch:required_channel")], [("📢 Kanalga nusxa", "ch:copy_channel")]]
-        return text, build_kb(rows, "menu:set")
-    if name == "look":
-        ac = autoclose_minutes()
-        text = (f"👁 Ko'rinish\n\nAvto-yopish: {f'{ac} daqiqa' if ac else 'o‘chiq'}\n"
-                f"Yangi foydalanuvchi xabari: {onoff(notify_on())}\n"
-                f"Yangi murojaat xabari: {onoff(notify_inbox_on())}")
-        rows = [
-            [("🧹 Avto-yopish", "autoclose")],
-            [(f"{'🔔' if notify_on() else '🔕'} Yangi foydalanuvchi", "notify")],
-            [(f"{'🔔' if notify_inbox_on() else '🔕'} Yangi murojaat", "notifyi")],
-        ]
-        return text, build_kb(rows, "menu:set")
-    # bosh panel
+    n_msg, n_sug = db.count_inbox("msg", "new"), db.count_inbox("suggest", "new")
+    ac = autoclose_minutes()
     text = (
         "🛠 Admin panel\n\n"
         f"👥 {s['active']} faol / {s['total']} jami · 📝 {s['messages']} ta kunlik xabar\n"
-        f"💬 Yangi murojaat: {new_inb}"
+        f"💬 Yangi murojaat: {new_inb}\n"
+        f"⏰ {send_time()} · {'⏸ to‘xtatilgan' if is_paused() else '✅ faol'} · "
+        f"🧹 {f'{ac} daq.' if ac else 'o‘chiq'}"
     )
     rows = [
-        [("📨 Xabarlar", "menu:msg"), (f"💬 Murojaatlar ({new_inb})", "menu:inb")],
-        [("👥 Foydalanuvchilar", "menu:usr"), ("📊 Statistika", "stats")],
-        [("⚙️ Sozlamalar", "menu:set")],
+        [("📢 Hammaga xabar", "bc"), ("✉️ Alohida xabar", "single")],
+        [("📜 Yuborilganlar", "sent"), (f"📅 Rejalashtirilgan ({s['scheduled']})", "sched")],
+        [("🔁 Takrorlanuvchi", "rec"), (f"📋 Kunlik xabarlar ({s['messages']})", "list")],
+        [(f"💬 Xabarlar ({n_msg})", "inbox:msg:0"), (f"💡 Takliflar ({n_sug})", "inbox:sug:0")],
+        [("🗂 Arxiv", "inbox:arch:0"), ("📊 Statistika", "stats")],
+        [("👥 Foydalanuvchilar", "users:0"), ("📥 Excel", "export")],
+        [("⏰ Vaqt", "time"), ("▶️ Yoqish" if is_paused() else "⏸ To'xtatish", "pause")],
+        [("👋 Salomlashuv", "welcome"), ("🏷 Kun sarlavhasi", "dtitle")],
+        [("📣 Majburiy obuna", "ch:required_channel"), ("📢 Kanalga nusxa", "ch:copy_channel")],
+        [("🧹 Avto-yopish", "autoclose"), ("🧾 Jurnal", "log")],
+        [(f"{'🔔' if notify_on() else '🔕'} Yangi foydalanuvchi", "notify"),
+         (f"{'🔔' if notify_inbox_on() else '🔕'} Yangi murojaat", "notifyi")],
     ]
+    if uid == ADMIN_ID:
+        rows.append([("🧑‍💼 Adminlar", "helpers")])
     return text, build_kb(rows)
 
 
-SCREENS = {"panel", "msg", "inb", "usr", "set", "send", "text", "chan", "look"}
+SCREENS = {"panel"}
 
 
 def bar(n: int, mx: int) -> str:
@@ -492,6 +592,20 @@ def stats_text() -> str:
     return "\n".join(lines)
 
 
+def log_text(limit: int = 30) -> str:
+    rows = dbcall("get_log", limit, default=None)
+    if rows is None:
+        return "🧾 Jurnal hali ulanmagan: db.py yangilanmagan."
+    if not rows:
+        return "🧾 Jurnal hozircha bo'sh."
+    lines = [f"🧾 Admin harakatlari (oxirgi {len(rows)} ta)\n"]
+    for r in rows:
+        det = f" — {short(r.get('details'), 40)}" if r.get("details") else ""
+        who_ = short(r.get("admin_name") or str(r.get("admin_id")), 14)
+        lines.append(f"{str(r['created_at'])[5:16]} · {who_} · {r['action']}{det}")
+    return "\n".join(lines)[:4000]
+
+
 # =============== Admin: panel (ochiladi / yopiladi) ===============
 async def send_panel(msg: Message, name=None):
     """Yangi panel yuboradi; eski ochiq panel bo'lsa, uni o'chiradi."""
@@ -503,17 +617,16 @@ async def send_panel(msg: Message, name=None):
             await bot.delete_message(chat_id, int(old))
         except TelegramBadRequest:
             pass
-    name = name if name in SCREENS else "panel"
     uid = msg.from_user.id if msg.from_user and not msg.from_user.is_bot else ADMIN_ID
-    text, kb = screen(name, uid)
+    text, kb = screen("panel", uid)
     m = await msg.answer(text, reply_markup=kb)
     _panels[chat_id] = m.message_id
     schedule_autoclose(m)
     return m
 
 
-async def show_screen(call: CallbackQuery, name: str):
-    text, kb = screen(name if name in SCREENS else "panel", call.from_user.id)
+async def show_screen(call: CallbackQuery, name: str = "panel"):
+    text, kb = screen("panel", call.from_user.id)
     await show(call, text, kb)
 
 
@@ -530,10 +643,6 @@ async def reply_panel(message: Message, state: FSMContext):
     """Tugma bosilsa: panel ochiq bo'lsa yopiladi, yopiq bo'lsa ochiladi."""
     await state.clear()
     chat_id = message.chat.id
-    try:
-        await message.delete()  # admin yozgan tugma matni chatda qolmasin
-    except TelegramBadRequest:
-        pass
     old = _panels.pop(chat_id, None)
     if old:
         _cancel((chat_id, old))
@@ -543,6 +652,89 @@ async def reply_panel(message: Message, state: FSMContext):
         except TelegramBadRequest:
             pass  # allaqachon o'chib ketgan bo'lsa, yangisini ochamiz
     await send_panel(message)
+
+
+@admin.message(F.text == BTN_SEND)
+@admin.message(Command("send"))
+async def cmd_send(message: Message, state: FSMContext):
+    await start_compose(message, state, "broadcast", "📢 Hammaga yuboriladigan xabar")
+
+
+@admin.message(Command("stats"))
+async def cmd_stats(message: Message, state: FSMContext):
+    await state.clear()
+    await show(message, stats_text(), back_kb())
+
+
+@admin.message(F.text == BTN_CLEAN)
+@admin.message(Command("clean"))
+async def cmd_clean(message: Message, state: FSMContext):
+    await state.clear()
+    await clean_service(message.chat.id)
+    await note(message, "🧹 Tozalandi", 3)
+
+
+@admin.message(F.text == BTN_LAST)
+async def btn_last(message: Message, state: FSMContext):
+    """Hammaga yuborilgan oxirgi xabarni (matn/ovoz/tugma bilan) qayta ko'rsatadi."""
+    await state.clear()
+    raw = db.get_setting("last_broadcast")
+    if not raw:
+        await note(message, "Hali hammaga xabar yuborilmagan.")
+        return
+    try:
+        c = json.loads(raw)
+    except ValueError:
+        await note(message, "Oxirgi xabarni o'qib bo'lmadi.")
+        return
+    m = await send_content(message.chat.id, c)
+    schedule_delete(m, 120)
+
+
+@admin.message(Command("log"))
+async def cmd_log(message: Message, state: FSMContext):
+    await state.clear()
+    await show(message, log_text(), back_kb())
+
+
+@admin.callback_query(F.data == "log")
+async def show_log(call: CallbackQuery):
+    await show(call, log_text(), back_kb())
+
+
+def make_backup(path: str) -> bytes:
+    tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+    tmp.close()
+    src, dst = sqlite3.connect(path), sqlite3.connect(tmp.name)
+    try:
+        with dst:
+            src.backup(dst)
+    finally:
+        src.close()
+        dst.close()
+    data = Path(tmp.name).read_bytes()
+    os.unlink(tmp.name)
+    return data
+
+
+@admin.message(Command("backup"))
+async def cmd_backup(message: Message, state: FSMContext):
+    await state.clear()
+    if message.from_user.id != ADMIN_ID:
+        await note(message, "Bu buyruq faqat asosiy admin uchun.")
+        return
+    path = Path(str(getattr(db, "DB_PATH", Path(__file__).parent / "bot.db")))
+    try:
+        data = await asyncio.to_thread(make_backup, str(path))
+    except Exception as e:
+        logging.warning("Backup xatosi: %s", e)
+        await note(message, "Baza nusxasini olib bo'lmadi.")
+        return
+    m = await bot.send_document(message.chat.id,
+                                BufferedInputFile(data, filename=f"bot_{db.today()}.db"),
+                                caption="🗄 Baza nusxasi (2 daqiqadan keyin o'chadi)")
+    schedule_delete(m, 120)
+    log_action(message.from_user, "Baza nusxasi")
 
 
 @admin.message(F.text.in_(LEGACY_BUTTONS))
@@ -555,13 +747,13 @@ async def legacy_buttons(message: Message, state: FSMContext):
 @admin.callback_query(F.data.startswith("sec:"))
 async def legacy_section(call: CallbackQuery, state: FSMContext):
     await state.clear()
-    await show_screen(call, "panel")
+    await show_screen(call)
 
 
 @admin.callback_query(F.data.startswith("menu:"))
 async def open_menu(call: CallbackQuery, state: FSMContext):
     await state.clear()
-    await show_screen(call, call.data.split(":", 1)[1])
+    await show_screen(call)
 
 
 @admin.callback_query(F.data == "close")
@@ -569,6 +761,7 @@ async def close_panel(call: CallbackQuery, state: FSMContext):
     await state.clear()
     msg = call.message
     _cancel((msg.chat.id, msg.message_id))
+    _service.get(msg.chat.id, set()).discard(msg.message_id)
     if _panels.get(msg.chat.id) == msg.message_id:
         _panels.pop(msg.chat.id, None)
     try:
@@ -581,7 +774,7 @@ async def close_panel(call: CallbackQuery, state: FSMContext):
 @admin.callback_query(F.data == "panel")
 async def back_to_panel(call: CallbackQuery, state: FSMContext):
     await state.clear()
-    await show_screen(call, "panel")
+    await show_screen(call)
 
 
 @admin.callback_query(F.data == "stats")
@@ -593,19 +786,20 @@ async def show_stats(call: CallbackQuery):
 @admin.callback_query(F.data == "pause")
 async def toggle_pause(call: CallbackQuery):
     db.set_setting("paused", "0" if is_paused() else "1")
-    await show_screen(call, "send")
+    log_action(call.from_user, "Kunlik yuborish", "to'xtatildi" if is_paused() else "yoqildi")
+    await show_screen(call)
 
 
 @admin.callback_query(F.data == "notify")
 async def toggle_notify(call: CallbackQuery):
     db.set_setting("notify_new", "0" if notify_on() else "1")
-    await show_screen(call, "look")
+    await show_screen(call)
 
 
 @admin.callback_query(F.data == "notifyi")
 async def toggle_notify_inbox(call: CallbackQuery):
     db.set_setting("notify_inbox", "0" if notify_inbox_on() else "1")
-    await show_screen(call, "look")
+    await show_screen(call)
 
 
 @admin.callback_query(F.data == "welcome")
@@ -624,8 +818,9 @@ async def welcome_save(message: Message, state: FSMContext):
     val = message.text.strip()
     db.set_setting("welcome_text", None if val == "-" else val)
     await state.clear()
+    log_action(message.from_user, "Salomlashuv matni o'zgardi")
     await note(message, "✅ Salomlashuv matni saqlandi.")
-    await send_panel(message, "text")
+    await send_panel(message)
 
 
 @admin.callback_query(F.data == "dtitle")
@@ -644,12 +839,13 @@ async def title_start(call: CallbackQuery, state: FSMContext):
 async def title_save(message: Message, state: FSMContext):
     val = message.text.strip()
     if len(val) > 100:
-        await message.answer("Sarlavha 100 belgidan oshmasin.", reply_markup=cancel_kb())
+        await ask(message, "Sarlavha 100 belgidan oshmasin.", cancel_kb())
         return
     db.set_setting("daily_title", None if val == "-" else val)
     await state.clear()
+    log_action(message.from_user, "Kun sarlavhasi o'zgardi", val)
     await note(message, "✅ Sarlavha saqlandi.")
-    await send_panel(message, "text")
+    await send_panel(message)
 
 
 @admin.callback_query(F.data == "autoclose")
@@ -666,12 +862,13 @@ async def autoclose_start(call: CallbackQuery, state: FSMContext):
 async def autoclose_save(message: Message, state: FSMContext):
     raw = message.text.strip()
     if not raw.isdigit() or not 0 <= int(raw) <= 1440:
-        await message.answer("0 dan 1440 gacha butun son yozing.", reply_markup=cancel_kb())
+        await ask(message, "0 dan 1440 gacha butun son yozing.", cancel_kb())
         return
     db.set_setting("autoclose", raw)
     await state.clear()
+    log_action(message.from_user, "Avto-yopish", f"{raw} daqiqa")
     await note(message, f"✅ Avto-yopish: {raw} daqiqa." if int(raw) else "✅ Avto-yopish o'chirildi.")
-    await send_panel(message, "look")
+    await send_panel(message)
 
 
 # =============== Admin: xabar yaratish (umumiy oqim) ===============
@@ -697,12 +894,12 @@ async def compose_content(message: Message, state: FSMContext):
     kb.button(text="⏭ Tugmasiz davom etish", callback_data="btn_no")
     kb.button(text="❌ Bekor qilish", callback_data="panel")
     kb.adjust(1)
-    await message.answer("Xabarga havola tugmasi qo'shamizmi?", reply_markup=kb.as_markup())
+    await ask(message, "Xabarga havola tugmasi qo'shamizmi?", kb.as_markup())
 
 
 @admin.message(Compose.content)
 async def compose_wrong_type(message: Message):
-    await message.answer("Faqat matn yoki ovozli xabar (🎤) yuboring.", reply_markup=cancel_kb())
+    await ask(message, "Faqat matn yoki ovozli xabar (🎤) yuboring.", cancel_kb())
 
 
 @admin.callback_query(Compose.button, F.data == "btn_yes")
@@ -717,24 +914,24 @@ async def button_ask(call: CallbackQuery):
 @admin.callback_query(Compose.button, F.data == "btn_no")
 async def button_skip(call: CallbackQuery, state: FSMContext):
     await call.answer()
-    await finalize(call.message, state)
+    await finalize(call.message, state, call.from_user)
 
 
 @admin.message(Compose.button, F.text)
 async def button_parse(message: Message, state: FSMContext):
     if "|" not in message.text:
-        await message.answer("Format: Tugma matni | https://havola", reply_markup=cancel_kb())
+        await ask(message, "Format: Tugma matni | https://havola", cancel_kb())
         return
     label, _, url = message.text.partition("|")
     label, url = label.strip(), url.strip()
     if not label or not re.match(r"^https?://\S+$", url):
-        await message.answer("Havola http:// yoki https:// bilan boshlanishi kerak.", reply_markup=cancel_kb())
+        await ask(message, "Havola http:// yoki https:// bilan boshlanishi kerak.", cancel_kb())
         return
     await state.update_data(btn_text=label, btn_url=url)
-    await finalize(message, state)
+    await finalize(message, state, message.from_user)
 
 
-async def finalize(msg: Message, state: FSMContext):
+async def finalize(msg: Message, state: FSMContext, actor=None):
     data = await state.get_data()
     mode = data.get("mode")
     c = data_to_content(data)
@@ -742,38 +939,50 @@ async def finalize(msg: Message, state: FSMContext):
     if mode == "daily_add":
         n = db.add_daily_message(c["text"], c["voice_id"], c["btn_text"], c["btn_url"])
         await state.clear()
+        log_action(actor, "Kunlik xabar qo'shildi", f"{n}-kun")
         await note(msg, f"✅ {n}-kun xabari saqlandi.")
-        await send_panel(msg, "msg")
+        await send_panel(msg)
 
     elif mode == "daily_edit":
         day = data["day"]
         db.update_daily_message(day, c["text"], c["voice_id"], c["btn_text"], c["btn_url"])
         await state.clear()
+        log_action(actor, "Kunlik xabar o'zgardi", f"{day}-kun")
         await note(msg, f"✅ {day}-kun xabari yangilandi.")
-        await send_panel(msg, "msg")
+        await send_panel(msg)
 
     elif mode == "broadcast":
         await state.set_state(None)  # ma'lumot saqlanib qoladi
-        await msg.answer("👇 Yuboriladigan xabar ko'rinishi:")
-        await send_content(msg.chat.id, c)
+        m1 = await msg.answer("👇 Yuboriladigan xabar ko'rinishi:")
+        m2 = await send_content(msg.chat.id, c)
         kb = InlineKeyboardBuilder()
         kb.button(text=f"✅ Yuborish ({len(db.active_users())} ta)", callback_data="bcok")
-        kb.button(text="❌ Bekor qilish", callback_data="panel")
-        kb.adjust(1)
-        await msg.answer("Hammaga yuborilsinmi?", reply_markup=kb.as_markup())
+        kb.button(text="✏️ O'zgartirish", callback_data="bcedit")
+        kb.button(text="❌ Bekor", callback_data="panel")
+        kb.adjust(1, 2)
+        m3 = await msg.answer("Hammaga yuborilsinmi?", reply_markup=paint(kb.as_markup()))
+        for m in (m1, m2, m3):
+            schedule_autoclose(m)
 
     elif mode == "schedule":
         await state.set_state(Compose.when)
-        await msg.answer(
-            f"📅 Qachon yuborilsin? Sana va vaqtni yozing ({TIMEZONE} vaqti bilan):\n\n"
-            "2026-11-05 09:30",
-            reply_markup=cancel_kb(),
-        )
+        await ask(msg,
+                  f"📅 Qachon yuborilsin? Sana va vaqtni yozing ({TIMEZONE} vaqti bilan):\n\n"
+                  "2026-11-05 09:30",
+                  cancel_kb())
+
+    elif mode == "recurring":
+        await state.set_state(None)
+        kb = InlineKeyboardBuilder()
+        kb.button(text="📆 Har kuni", callback_data="rcf:d")
+        kb.button(text="🗓 Haftada bir marta", callback_data="rcf:w")
+        kb.button(text="❌ Bekor qilish", callback_data="panel")
+        kb.adjust(2, 1)
+        await ask(msg, "🔁 Qanday takrorlansin?", kb.as_markup())
 
     elif mode == "single":
         await state.set_state(Compose.target)
-        await msg.answer("Kimga yuborilsin? Foydalanuvchi ID raqami yoki @username ni yozing:",
-                         reply_markup=cancel_kb())
+        await ask(msg, "Kimga yuborilsin? Foydalanuvchi ID raqami yoki @username ni yozing:", cancel_kb())
 
     else:
         await state.clear()
@@ -787,6 +996,11 @@ async def bc_start(call: CallbackQuery, state: FSMContext):
     await start_compose(call, state, "broadcast", "📢 Hammaga yuboriladigan xabar")
 
 
+@admin.callback_query(F.data == "bcedit")
+async def bc_edit(call: CallbackQuery, state: FSMContext):
+    await start_compose(call, state, "broadcast", "✏️ Xabarni qaytadan yuboring")
+
+
 @admin.callback_query(F.data == "bcok")
 async def bc_send(call: CallbackQuery, state: FSMContext):
     data = await state.get_data()
@@ -796,11 +1010,104 @@ async def bc_send(call: CallbackQuery, state: FSMContext):
         await call.answer("Xabar topilmadi", show_alert=True)
         return
     await call.answer()
-    await call.message.edit_text("⏳ Yuborilmoqda...")
-    sent, failed = await send_to_all(c)
-    await copy_to_channel(c)
-    await call.message.edit_text(
-        f"✅ Yuborildi: {sent}\n🚫 Yetmadi: {failed}", reply_markup=back_kb("panel", "⬅️ Panel"))
+    try:
+        await call.message.edit_text("⏳ Yuborilmoqda...")
+    except TelegramBadRequest:
+        pass
+    sent, failed, _bid = await broadcast(c, "broadcast", call.from_user.id)
+    db.set_setting("last_broadcast", json.dumps(c, ensure_ascii=False))
+    log_action(call.from_user, "Hammaga xabar", f"yetdi {sent}, yetmadi {failed}")
+    result = f"✅ Yetdi: {sent}\n🚫 Yetmadi: {failed}"
+    kb = build_kb([[("📜 Yuborilganlar", "sent")]], "panel")
+    try:
+        await call.message.edit_text(result, reply_markup=kb)
+    except TelegramBadRequest:
+        await call.message.answer(result, reply_markup=kb)
+
+
+# ---------- Yuborilganlar: hammadan o'chirish (48 soat ichida) ----------
+@admin.callback_query(F.data == "sent")
+async def sent_list(call: CallbackQuery, state: FSMContext):
+    await state.clear()
+    rows = dbcall("list_batches", DELETE_WINDOW_HOURS, default=None)
+    if rows is None:
+        await show(call, "📜 Yuborilganlar hali ulanmagan: db.py yangilanmagan.", back_kb())
+        return
+    kb = InlineKeyboardBuilder()
+    for r in rows:
+        icon = "▫️" if r.get("deleted") else "📨"
+        kb.row(InlineKeyboardButton(
+            text=f"{icon} {str(r['created_at'])[5:16]} · {short(r['preview'], 18)} ({r['sent']})",
+            callback_data=f"bt:{r['id']}"))
+    kb.row(InlineKeyboardButton(text="⬅️ Orqaga", callback_data="panel"),
+           InlineKeyboardButton(text="❌ Yopish", callback_data="close"))
+    text = (f"📜 Yuborilganlar (oxirgi {DELETE_WINDOW_HOURS} soat)\nBosib, hammadan o'chirishingiz mumkin."
+            if rows else f"📜 Oxirgi {DELETE_WINDOW_HOURS} soatda yuborilgan xabarlar yo'q.")
+    await show(call, text, kb.as_markup())
+
+
+@admin.callback_query(F.data.startswith("bt:"))
+async def sent_view(call: CallbackQuery):
+    bid = int(call.data.split(":")[1])
+    r = dbcall("get_batch", bid, default=None)
+    if not r:
+        await call.answer("Topilmadi", show_alert=True)
+        return
+    text = (f"📜 Yuborilgan xabar #{r['id']}\n🕒 {r['created_at']}\n"
+            f"✅ Yetdi: {r['sent']}   🚫 Yetmadi: {r['failed']}\n\n{r['preview']}")
+    rows = []
+    if r.get("deleted"):
+        text += "\n\n🗑 Hammadan o'chirilgan."
+    else:
+        rows.append([("🗑 Hammadan o'chirish", f"btdel:{bid}")])
+    await show(call, text, build_kb(rows, "sent"))
+
+
+@admin.callback_query(F.data.startswith("btdel:"))
+async def sent_delete_ask(call: CallbackQuery):
+    bid = int(call.data.split(":")[1])
+    rows = [[("✅ Ha, o'chirish", f"btdelok:{bid}"), ("❌ Yo'q", f"bt:{bid}")]]
+    await show(call, "Bu xabar hamma foydalanuvchilardan o'chirilsinmi?\nBu amalni qaytarib bo'lmaydi.",
+               build_kb(rows))
+
+
+async def delete_batch_messages(items):
+    ok = fail = 0
+    for chat_id, mid in items:
+        try:
+            await bot.delete_message(chat_id, mid)
+            ok += 1
+        except TelegramRetryAfter as e:
+            await asyncio.sleep(e.retry_after)
+            try:
+                await bot.delete_message(chat_id, mid)
+                ok += 1
+            except Exception:
+                fail += 1
+        except Exception:
+            fail += 1
+        await asyncio.sleep(0.04)
+    return ok, fail
+
+
+@admin.callback_query(F.data.startswith("btdelok:"))
+async def sent_delete_do(call: CallbackQuery):
+    bid = int(call.data.split(":")[1])
+    await call.answer()
+    try:
+        await call.message.edit_text("⏳ O'chirilmoqda...")
+    except TelegramBadRequest:
+        pass
+    items = dbcall("batch_items", bid, default=[]) or []
+    ok, fail = await delete_batch_messages(items)
+    dbcall("mark_batch_deleted", bid)
+    log_action(call.from_user, "Hammadan o'chirildi", f"#{bid}: {ok} ta o'chdi, {fail} ta o'chmadi")
+    text = f"🗑 O'chirildi: {ok}\n⚠️ O'chmadi: {fail}"
+    kb = back_kb("sent")
+    try:
+        await call.message.edit_text(text, reply_markup=kb)
+    except TelegramBadRequest:
+        await call.message.answer(text, reply_markup=kb)
 
 
 # ---------- Alohida foydalanuvchiga ----------
@@ -813,15 +1120,15 @@ async def single_start(call: CallbackQuery, state: FSMContext):
 async def single_send(message: Message, state: FSMContext):
     u = db.find_user(message.text)
     if not u:
-        await message.answer("Foydalanuvchi topilmadi. ID yoki @username ni tekshiring.",
-                             reply_markup=cancel_kb())
+        await ask(message, "Foydalanuvchi topilmadi. ID yoki @username ni tekshiring.", cancel_kb())
         return
     data = await state.get_data()
-    ok = await safe_send(u["user_id"], data_to_content(data))
+    ok = bool(await safe_send(u["user_id"], data_to_content(data)))
     await state.clear()
+    log_action(message.from_user, "Alohida xabar", f"{u['user_id']}: {'yetdi' if ok else 'yetmadi'}")
     await note(message,
                "✅ Yuborildi." if ok else "🚫 Yuborib bo'lmadi (foydalanuvchi botni bloklagan bo'lishi mumkin).")
-    await send_panel(message, "msg")
+    await send_panel(message)
 
 
 # ---------- Rejalashtirish ----------
@@ -844,7 +1151,7 @@ async def sched_list(call: CallbackQuery, state: FSMContext):
         kb.row(InlineKeyboardButton(text=f"🗑 {r['run_at']} · {icon}{short(r['text'], 20)}",
                                     callback_data=f"scdel:{r['id']}"))
     kb.row(InlineKeyboardButton(text="➕ Yangi rejalashtirish", callback_data="scnew"))
-    kb.row(InlineKeyboardButton(text="⬅️ Orqaga", callback_data="menu:msg"),
+    kb.row(InlineKeyboardButton(text="⬅️ Orqaga", callback_data="panel"),
            InlineKeyboardButton(text="❌ Yopish", callback_data="close"))
     text = ("📅 Rejalashtirilgan xabarlar\n(o'chirish uchun bosing)" if rows
             else "Rejalashtirilgan xabarlar yo'q.")
@@ -868,7 +1175,9 @@ async def sched_delete(call: CallbackQuery, state: FSMContext):
 
 @admin.callback_query(F.data.startswith("scdelok:"))
 async def sched_delete_do(call: CallbackQuery, state: FSMContext):
-    db.delete_scheduled(int(call.data.split(":")[1]))
+    sid = int(call.data.split(":")[1])
+    db.delete_scheduled(sid)
+    log_action(call.from_user, "Rejalashtirilgan xabar o'chirildi", f"#{sid}")
     await sched_list(call, state)
 
 
@@ -876,17 +1185,140 @@ async def sched_delete_do(call: CallbackQuery, state: FSMContext):
 async def sched_save(message: Message, state: FSMContext):
     dt = parse_when(message.text)
     if not dt:
-        await message.answer("Format noto'g'ri. Masalan: 2026-11-05 09:30", reply_markup=cancel_kb())
+        await ask(message, "Format noto'g'ri. Masalan: 2026-11-05 09:30", cancel_kb())
         return
     if dt <= db.now():
-        await message.answer("Bu vaqt o'tib ketgan. Kelajakdagi vaqtni yozing.", reply_markup=cancel_kb())
+        await ask(message, "Bu vaqt o'tib ketgan. Kelajakdagi vaqtni yozing.", cancel_kb())
         return
     c = data_to_content(await state.get_data())
     run_at = dt.strftime("%Y-%m-%d %H:%M")
     db.add_scheduled(run_at, c["text"], c["voice_id"], c["btn_text"], c["btn_url"])
     await state.clear()
+    log_action(message.from_user, "Xabar rejalashtirildi", run_at)
     await note(message, f"✅ Xabar {run_at} da hammaga yuboriladi.")
-    await send_panel(message, "msg")
+    await send_panel(message)
+
+
+# ---------- Takrorlanuvchi xabar (har kuni / haftada bir) ----------
+def rec_when(r: dict) -> str:
+    if r.get("freq") == "weekly":
+        try:
+            return f"{WEEKDAYS[int(r['weekday'])]} {r['send_at']}"
+        except (TypeError, ValueError, IndexError):
+            return f"Haftada bir {r['send_at']}"
+    return f"Har kuni {r['send_at']}"
+
+
+def schedule_recurring(r: dict):
+    hour, minute = map(int, r["send_at"].split(":"))
+    kw = dict(hour=hour, minute=minute)
+    if r.get("freq") == "weekly":
+        kw["day_of_week"] = int(r["weekday"])  # APScheduler: 0 = dushanba
+    scheduler.add_job(run_recurring, "cron", args=[r["id"]], id=f"rec{r['id']}",
+                      replace_existing=True, misfire_grace_time=300, coalesce=True, **kw)
+
+
+def unschedule_recurring(rid: int):
+    try:
+        scheduler.remove_job(f"rec{rid}")
+    except Exception:
+        pass
+
+
+async def run_recurring(rid: int):
+    r = dbcall("get_recurring", rid, default=None)
+    if not r:
+        return
+    c = row_to_content(r)
+    sent, failed, _bid = await broadcast(c, "recurring")
+    await notify_admin(f"🔁 Takrorlanuvchi xabar yuborildi ({rec_when(r)}): yetdi {sent}, yetmadi {failed}")
+
+
+@admin.callback_query(F.data == "rec")
+async def rec_list(call: CallbackQuery, state: FSMContext):
+    await state.clear()
+    rows = dbcall("list_recurring", default=None)
+    if rows is None:
+        await show(call, "🔁 Takrorlanuvchi xabarlar hali ulanmagan: db.py yangilanmagan.", back_kb())
+        return
+    kb = InlineKeyboardBuilder()
+    for r in rows:
+        icon = "🎤 " if r.get("voice_id") else ""
+        kb.row(InlineKeyboardButton(text=f"🗑 {rec_when(r)} · {icon}{short(r['text'], 16)}",
+                                    callback_data=f"rcdel:{r['id']}"))
+    kb.row(InlineKeyboardButton(text="➕ Yangi takrorlanuvchi", callback_data="rcnew"))
+    kb.row(InlineKeyboardButton(text="⬅️ Orqaga", callback_data="panel"),
+           InlineKeyboardButton(text="❌ Yopish", callback_data="close"))
+    text = ("🔁 Takrorlanuvchi xabarlar\n(o'chirish uchun bosing)" if rows
+            else "🔁 Takrorlanuvchi xabarlar yo'q.")
+    await show(call, text, kb.as_markup())
+
+
+@admin.callback_query(F.data == "rcnew")
+async def rec_new(call: CallbackQuery, state: FSMContext):
+    await start_compose(call, state, "recurring", "🔁 Takrorlanuvchi xabar")
+
+
+@admin.callback_query(F.data == "rcf:d")
+async def rec_daily(call: CallbackQuery, state: FSMContext):
+    await state.update_data(freq="daily", weekday=None)
+    await state.set_state(Compose.rtime)
+    await show(call, "⏰ Har kuni soat nechada yuborilsin? SS:DD ko'rinishida yozing (masalan 09:30):",
+               cancel_kb())
+
+
+@admin.callback_query(F.data == "rcf:w")
+async def rec_weekly(call: CallbackQuery, state: FSMContext):
+    rows = [[(WEEKDAYS[i], f"rcw:{i}") for i in range(j, min(j + 3, 7))] for j in range(0, 7, 3)]
+    await show(call, "🗓 Haftaning qaysi kuni?", build_kb(rows, None))
+
+
+@admin.callback_query(F.data.startswith("rcw:"))
+async def rec_weekday(call: CallbackQuery, state: FSMContext):
+    wd = int(call.data.split(":")[1])
+    await state.update_data(freq="weekly", weekday=wd)
+    await state.set_state(Compose.rtime)
+    await show(call, f"⏰ {WEEKDAYS[wd]} kuni soat nechada yuborilsin? SS:DD ko'rinishida yozing (masalan 09:30):",
+               cancel_kb())
+
+
+@admin.message(Compose.rtime, F.text)
+async def rec_save(message: Message, state: FSMContext):
+    m = re.fullmatch(r"([01]?\d|2[0-3]):([0-5]\d)", message.text.strip())
+    if not m:
+        await ask(message, "Noto'g'ri format. Masalan: 09:30", cancel_kb())
+        return
+    value = f"{int(m.group(1)):02d}:{int(m.group(2)):02d}"
+    data = await state.get_data()
+    c = data_to_content(data)
+    freq, weekday = data.get("freq", "daily"), data.get("weekday")
+    rid = dbcall("add_recurring", freq, weekday, value, c["text"], c["voice_id"], c["btn_text"], c["btn_url"])
+    await state.clear()
+    if not rid:
+        await note(message, "🚫 Saqlab bo'lmadi: db.py da takrorlanuvchi xabar jadvali yo'q.")
+        await send_panel(message)
+        return
+    r = {"id": rid, "freq": freq, "weekday": weekday, "send_at": value}
+    schedule_recurring(r)
+    log_action(message.from_user, "Takrorlanuvchi xabar qo'shildi", rec_when(r))
+    await note(message, f"✅ Takrorlanuvchi xabar saqlandi: {rec_when(r)}")
+    await send_panel(message)
+
+
+@admin.callback_query(F.data.startswith("rcdel:"))
+async def rec_delete_ask(call: CallbackQuery):
+    rid = int(call.data.split(":")[1])
+    rows = [[("✅ Ha, o'chirish", f"rcdelok:{rid}"), ("❌ Yo'q", "rec")]]
+    await show(call, "Bu takrorlanuvchi xabarni o'chirasizmi?", build_kb(rows))
+
+
+@admin.callback_query(F.data.startswith("rcdelok:"))
+async def rec_delete_do(call: CallbackQuery, state: FSMContext):
+    rid = int(call.data.split(":")[1])
+    unschedule_recurring(rid)
+    dbcall("delete_recurring", rid)
+    log_action(call.from_user, "Takrorlanuvchi xabar o'chirildi", f"#{rid}")
+    await rec_list(call, state)
 
 
 # =============== Admin: kunlik xabarlar ===============
@@ -906,7 +1338,7 @@ async def list_messages(call: CallbackQuery, state: FSMContext):
         kb.row(InlineKeyboardButton(text=f"{r['day']}-kun: {icon}{short(r['text'])}",
                                     callback_data=f"msg:{r['day']}"))
     kb.row(InlineKeyboardButton(text="➕ Yangi xabar", callback_data="add"))
-    kb.row(InlineKeyboardButton(text="⬅️ Orqaga", callback_data="menu:msg"),
+    kb.row(InlineKeyboardButton(text="⬅️ Orqaga", callback_data="panel"),
            InlineKeyboardButton(text="❌ Yopish", callback_data="close"))
     text = "📋 Kunlik xabarlar" if rows else "Hali kunlik xabarlar yo'q. ➕ bilan birinchisini qo'shing."
     await show(call, text, kb.as_markup())
@@ -964,7 +1396,9 @@ async def delete_ask(call: CallbackQuery):
 
 @admin.callback_query(F.data.startswith("delok:"))
 async def delete_do(call: CallbackQuery, state: FSMContext):
-    db.delete_daily_message(int(call.data.split(":")[1]))
+    day = int(call.data.split(":")[1])
+    db.delete_daily_message(day)
+    log_action(call.from_user, "Kunlik xabar o'chirildi", f"{day}-kun")
     await call.answer("O'chirildi")
     await list_messages(call, state)
 
@@ -998,7 +1432,7 @@ async def inbox_page(call: CallbackQuery, mode: str, page: int):
         nav.append(InlineKeyboardButton(text="▶️", callback_data=f"inbox:{mode}:{page + 1}"))
     if nav:
         kb.row(*nav)
-    kb.row(InlineKeyboardButton(text="⬅️ Orqaga", callback_data="menu:inb"),
+    kb.row(InlineKeyboardButton(text="⬅️ Orqaga", callback_data="panel"),
            InlineKeyboardButton(text="❌ Yopish", callback_data="close"))
     text = f"{title} ({total}) — {page + 1}/{pages}" if rows else f"{title}\n\nHozircha bo'sh."
     await show(call, text, kb.as_markup())
@@ -1068,14 +1502,15 @@ async def inbox_reply_send(message: Message, state: FSMContext):
     await state.clear()
     if not r:
         await note(message, "Murojaat topilmadi.")
-        await send_panel(message, "inb")
+        await send_panel(message)
         return
     ok = await tell(r["user_id"], f"💌 Admin javobi:\n\n{message.text}")
     if ok:
         db.set_inbox_done(r["id"], "replied")
+        log_action(message.from_user, "Murojaatga javob", f"#{r['id']} → {r['user_id']}")
     await note(message, "✅ Javob yuborildi va arxivga olindi." if ok
                else "🚫 Javob yetmadi (foydalanuvchi botni bloklagan bo'lishi mumkin). Murojaat joyida qoldi.")
-    await send_panel(message, "inb")
+    await send_panel(message)
 
 
 @admin.callback_query(F.data.startswith("iarc:"))
@@ -1084,8 +1519,9 @@ async def inbox_archive(call: CallbackQuery):
     if not r:
         return
     db.set_inbox_done(r["id"], "archived")
+    log_action(call.from_user, "Murojaat arxivga", f"#{r['id']}")
     await call.answer("Arxivga olindi")
-    await show_screen(call, "inb")
+    await show_screen(call)
 
 
 @admin.callback_query(F.data.startswith("iacc:"))
@@ -1095,9 +1531,10 @@ async def inbox_accept(call: CallbackQuery):
         return
     n = db.add_daily_message(r["text"])
     db.set_inbox_done(r["id"], "accepted")
+    log_action(call.from_user, "Taklif qabul qilindi", f"#{r['id']} → {n}-kun")
     await tell(r["user_id"], "✅ Taklifingiz qabul qilindi va kunlik xabarlarga qo'shildi. Rahmat! 💛")
     await call.answer(f"✅ {n}-kun xabari bo'ldi")
-    await show_screen(call, "inb")
+    await show_screen(call)
 
 
 @admin.callback_query(F.data.startswith("iedit:"))
@@ -1118,13 +1555,14 @@ async def inbox_edit_save(message: Message, state: FSMContext):
     await state.clear()
     if not r or r["status"] != "new":
         await note(message, "Taklif topilmadi.")
-        await send_panel(message, "inb")
+        await send_panel(message)
         return
     n = db.add_daily_message(message.text)
     db.set_inbox_done(r["id"], "accepted")
+    log_action(message.from_user, "Taklif tahrirlab qabul qilindi", f"#{r['id']} → {n}-kun")
     await tell(r["user_id"], "✅ Taklifingiz (kichik tahrir bilan) kunlik xabarlarga qo'shildi. Rahmat! 💛")
     await note(message, f"✅ {n}-kun xabari sifatida saqlandi.")
-    await send_panel(message, "inb")
+    await send_panel(message)
 
 
 @admin.callback_query(F.data.startswith("irej:"))
@@ -1133,9 +1571,10 @@ async def inbox_reject(call: CallbackQuery):
     if not r:
         return
     db.set_inbox_done(r["id"], "rejected")
+    log_action(call.from_user, "Taklif rad etildi", f"#{r['id']}")
     await tell(r["user_id"], "Taklifingiz uchun rahmat! Bu safar uni qo'sha olmadik, lekin yangi g'oyalaringizni kutamiz 🌿")
     await call.answer("Rad etildi")
-    await show_screen(call, "inb")
+    await show_screen(call)
 
 
 @admin.callback_query(F.data.startswith("idel:"))
@@ -1150,9 +1589,11 @@ async def inbox_delete_ask(call: CallbackQuery):
 
 @admin.callback_query(F.data.startswith("idelok:"))
 async def inbox_delete_do(call: CallbackQuery):
-    db.delete_inbox(int(call.data.split(":")[1]))
+    iid = int(call.data.split(":")[1])
+    db.delete_inbox(iid)
+    log_action(call.from_user, "Murojaat o'chirildi", f"#{iid}")
     await call.answer("O'chirildi")
-    await show_screen(call, "inb")
+    await show_screen(call)
 
 
 # =============== Admin: foydalanuvchilar ===============
@@ -1179,7 +1620,7 @@ async def users_page(target, page: int):
     if nav:
         kb.row(*nav)
     kb.row(InlineKeyboardButton(text="🔎 Qidirish", callback_data="usearch"))
-    kb.row(InlineKeyboardButton(text="⬅️ Orqaga", callback_data="menu:usr"),
+    kb.row(InlineKeyboardButton(text="⬅️ Orqaga", callback_data="panel"),
            InlineKeyboardButton(text="❌ Yopish", callback_data="close"))
     await show(target, "\n".join(lines), kb.as_markup())
 
@@ -1258,6 +1699,7 @@ async def user_reset_ask(call: CallbackQuery):
 async def user_reset(call: CallbackQuery):
     uid = int(call.data.split(":")[1])
     db.reset_user_progress(uid)
+    log_action(call.from_user, "Foydalanuvchi kunlari boshidan", str(uid))
     await call.answer("1-kundan boshlanadi")
     await show_user(call, uid)
 
@@ -1268,6 +1710,8 @@ async def user_toggle(call: CallbackQuery):
     u = db.get_user(uid)
     if u:
         db.set_active(uid, not u["active"])
+        log_action(call.from_user, "Foydalanuvchi holati",
+                   f"{uid}: {'nofaol' if u['active'] else 'faol'}")
     await call.answer("Yangilandi")
     await show_user(call, uid)
 
@@ -1293,6 +1737,7 @@ async def export_users(call: CallbackQuery):
     await bot.send_document(call.message.chat.id,
                             BufferedInputFile(build_xlsx(), filename=name),
                             caption=f"👥 Foydalanuvchilar: {db.count_users()} ta")
+    log_action(call.from_user, "Excel yuklab olindi")
 
 
 # =============== Yordamchi adminlar ===============
@@ -1300,7 +1745,14 @@ async def set_commands_for(user_id: int, is_admin: bool):
     cmds = [BotCommand(command="start", description="Botni ishga tushirish")]
     try:
         if is_admin:
-            cmds.append(BotCommand(command="admin", description="Admin panel"))
+            cmds += [
+                BotCommand(command="admin", description="Admin panel"),
+                BotCommand(command="send", description="Xabar yuborish"),
+                BotCommand(command="stats", description="Statistika"),
+                BotCommand(command="clean", description="Tozalash"),
+                BotCommand(command="backup", description="Baza nusxasi"),
+                BotCommand(command="log", description="Admin harakatlari jurnali"),
+            ]
             await bot.set_my_commands(cmds, scope=BotCommandScopeChat(chat_id=user_id))
         else:
             await bot.delete_my_commands(scope=BotCommandScopeChat(chat_id=user_id))
@@ -1309,7 +1761,7 @@ async def set_commands_for(user_id: int, is_admin: bool):
 
 
 async def set_commands():
-    """Oddiy foydalanuvchi faqat /start ni ko'radi; adminlar /start va /admin ni."""
+    """Oddiy foydalanuvchi faqat /start ni ko'radi; adminlar hamma buyruqni."""
     try:
         await bot.set_my_commands([BotCommand(command="start", description="Botni ishga tushirish")],
                                   scope=BotCommandScopeDefault())
@@ -1336,7 +1788,7 @@ async def helpers_menu(call: CallbackQuery, state: FSMContext):
     btns = [[("➕ Admin qo'shish", "helper:add")]]
     if rows:
         btns.append([("➖ Admin olib tashlash", "helper:remove")])
-    await show(call, "\n".join(lines), build_kb(btns, "menu:set"))
+    await show(call, "\n".join(lines), build_kb(btns, "panel"))
 
 
 @admin.callback_query(F.data == "helper:add")
@@ -1355,14 +1807,14 @@ async def helper_add_save(message: Message, state: FSMContext):
         return
     raw = message.text.strip()
     if not raw.isdigit() or int(raw) == ADMIN_ID:
-        await message.answer("ID raqam bo'lishi kerak (asosiy admin ID'sini kiritmang).",
-                             reply_markup=cancel_kb())
+        await ask(message, "ID raqam bo'lishi kerak (asosiy admin ID'sini kiritmang).", cancel_kb())
         return
     db.add_helper_admin(int(raw), ADMIN_ID)
     await set_commands_for(int(raw), True)
     await state.clear()
+    log_action(message.from_user, "Yordamchi admin qo'shildi", raw)
     await note(message, f"✅ {raw} yordamchi admin qilindi.")
-    await send_panel(message, "set")
+    await send_panel(message)
 
 
 @admin.callback_query(F.data == "helper:remove")
@@ -1381,14 +1833,15 @@ async def helper_remove_save(message: Message, state: FSMContext):
         return
     raw = message.text.strip()
     if not raw.isdigit():
-        await message.answer("ID raqamini yuboring.", reply_markup=cancel_kb())
+        await ask(message, "ID raqamini yuboring.", cancel_kb())
         return
     removed = db.remove_helper_admin(int(raw))
     if removed:
         await set_commands_for(int(raw), False)
+        log_action(message.from_user, "Yordamchi admin olib tashlandi", raw)
     await state.clear()
     await note(message, "✅ Yordamchi admin olib tashlandi." if removed else "Bunday admin topilmadi.")
-    await send_panel(message, "set")
+    await send_panel(message)
 
 
 # =============== Admin: yuborish vaqti ===============
@@ -1403,15 +1856,16 @@ async def time_start(call: CallbackQuery, state: FSMContext):
 async def time_save(message: Message, state: FSMContext):
     m = re.fullmatch(r"([01]?\d|2[0-3]):([0-5]\d)", message.text.strip())
     if not m:
-        await message.answer("Noto'g'ri format. Masalan: 09:30", reply_markup=cancel_kb())
+        await ask(message, "Noto'g'ri format. Masalan: 09:30", cancel_kb())
         return
     hour, minute = int(m.group(1)), int(m.group(2))
     value = f"{hour:02d}:{minute:02d}"
     db.set_setting("send_time", value)
     scheduler.reschedule_job("daily", trigger="cron", hour=hour, minute=minute)
     await state.clear()
+    log_action(message.from_user, "Yuborish vaqti o'zgardi", value)
     await note(message, f"✅ Endi xabarlar har kuni {value} da yuboriladi.")
-    await send_panel(message, "send")
+    await send_panel(message)
 
 
 # =============== Admin: kanallar (majburiy obuna / nusxa) ===============
@@ -1433,7 +1887,7 @@ async def channel_menu(call: CallbackQuery, state: FSMContext):
     rows = [[("✏️ Kanalni kiritish / o'zgartirish", f"chset:{key}")]]
     if channel:
         rows.append([("🚫 O'chirish", f"choff:{key}")])
-    await show(call, f"{CHANNEL_KEYS[key]}: {channel or 'o‘chiq'}\n\n{info}", build_kb(rows, "menu:chan"))
+    await show(call, f"{CHANNEL_KEYS[key]}: {channel or 'o‘chiq'}\n\n{info}", build_kb(rows, "panel"))
 
 
 @admin.callback_query(F.data.startswith("chset:"))
@@ -1452,6 +1906,7 @@ async def channel_off(call: CallbackQuery, state: FSMContext):
     key = call.data.split(":", 1)[1]
     if key in CHANNEL_KEYS:
         db.set_setting(key, None)
+        log_action(call.from_user, f"{CHANNEL_KEYS[key]} o'chirildi")
     await call.answer("O'chirildi")
     call.data = f"ch:{key}"
     await channel_menu(call, state)
@@ -1465,7 +1920,7 @@ async def channel_save(message: Message, state: FSMContext):
         await state.clear()
         return
     if not re.fullmatch(r"@[A-Za-z0-9_]{4,}", channel):
-        await message.answer("Format: @kanal_nomi", reply_markup=cancel_kb())
+        await ask(message, "Format: @kanal_nomi", cancel_kb())
         return
     try:
         me = await bot.me()
@@ -1473,14 +1928,15 @@ async def channel_save(message: Message, state: FSMContext):
         if member.status not in ("administrator", "creator"):
             raise ValueError("bot admin emas")
     except Exception:
-        await message.answer(
-            "Kanal topilmadi yoki bot unda administrator emas. Botni kanalga admin qilib qo'shing "
-            "va qayta yozing.", reply_markup=cancel_kb())
+        await ask(message,
+                  "Kanal topilmadi yoki bot unda administrator emas. Botni kanalga admin qilib qo'shing "
+                  "va qayta yozing.", cancel_kb())
         return
     db.set_setting(key, channel)
     await state.clear()
+    log_action(message.from_user, f"{CHANNEL_KEYS[key]}", channel)
     await note(message, f"✅ {CHANNEL_KEYS[key]}: {channel}")
-    await send_panel(message, "chan")
+    await send_panel(message)
 
 
 # =============== Foydalanuvchi ===============
@@ -1519,12 +1975,8 @@ async def welcome(message: Message, user):
         await message.answer(text, reply_markup=user_kb())
     if is_new and ADMIN_ID and notify_on():
         uname = f"@{user.username}" if user.username else "—"
-        try:
-            await bot.send_message(
-                ADMIN_ID, f"🆕 Yangi foydalanuvchi: {user.full_name} | {uname} | {user.id}\n"
-                          f"Jami: {db.count_users()} ta")
-        except Exception as e:
-            logging.warning("Adminga xabar yuborib bo'lmadi: %s", e)
+        await notify_admin(f"🆕 Yangi foydalanuvchi: {user.full_name} | {uname} | {user.id}\n"
+                           f"Jami: {db.count_users()} ta")
 
 
 @user_router.message(CommandStart())
@@ -1552,8 +2004,8 @@ async def check_subscription(call: CallbackQuery):
     await welcome(call.message, call.from_user)
 
 
-@user_router.message(F.text.in_(LEGACY_BUTTONS))
-async def legacy_buttons_user(message: Message):
+@user_router.message(F.text.in_(USER_STALE_BUTTONS))
+async def stale_buttons_user(message: Message):
     await message.answer("Bu bo'lim olib tashlangan. Tugmalar yangilandi 👇",
                          reply_markup=reply_kb(is_admin_id(message.from_user.id)))
 
@@ -1611,7 +2063,7 @@ async def notify_admin_inbox(user, title: str):
     if ADMIN_ID and notify_inbox_on():
         uname = f"@{user.username}" if user.username else "—"
         await tell(ADMIN_ID, f"{title}: {user.full_name} | {uname}\n"
-                             f"Ko'rish: /admin → 💬 Murojaatlar ({db.count_inbox(None, 'new')})")
+                             f"Ko'rish: /admin → 💬 Xabarlar ({db.count_inbox(None, 'new')})")
 
 
 # ---------- Reaksiyalar ----------
@@ -1637,6 +2089,10 @@ async def reaction(call: CallbackQuery):
 async def user_free_text(message: Message):
     u = message.from_user
     if is_admin_id(u.id):
+        try:
+            await message.delete()  # admin yozgan ortiqcha matn chatda qolmasin
+        except TelegramBadRequest:
+            pass
         return
     if not db.get_user(u.id):
         await message.answer("Avval /start ni bosing 🌿")
@@ -1680,13 +2136,8 @@ async def check_scheduled():
     for r in db.due_scheduled(now_str):
         db.mark_scheduled_done(r["id"])  # ikki marta yuborilmasligi uchun avval belgilanadi
         c = row_to_content(r)
-        sent, failed = await send_to_all(c)
-        await copy_to_channel(c)
-        try:
-            await bot.send_message(
-                ADMIN_ID, f"📅 Rejalashtirilgan xabar yuborildi ({r['run_at']}): {sent} ta, yetmadi: {failed}")
-        except Exception:
-            pass
+        sent, failed, _bid = await broadcast(c, "scheduled")
+        await notify_admin(f"📅 Rejalashtirilgan xabar yuborildi ({r['run_at']}): yetdi {sent}, yetmadi {failed}")
 
 
 async def main():
@@ -1696,6 +2147,11 @@ async def main():
                       id="daily", replace_existing=True)
     scheduler.add_job(check_scheduled, "interval", seconds=30,
                       id="sched", replace_existing=True, max_instances=1)
+    for r in dbcall("list_recurring", default=[]) or []:
+        try:
+            schedule_recurring(r)
+        except Exception:
+            logging.exception("Takrorlanuvchi xabarni jadvalga qo'shib bo'lmadi: %s", r)
     scheduler.start()
     dp.include_router(admin)
     dp.include_router(user_router)
